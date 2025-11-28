@@ -196,10 +196,6 @@ impl ExternalManifestCommitHandler {
             e_tag,
         };
 
-        if !copied {
-            return Ok(location);
-        }
-
         // step 2: flip the external store to point to the final location
         self.external_manifest_store
             .put_if_exists(
@@ -210,6 +206,10 @@ impl ExternalManifestCommitHandler {
                 location.e_tag.clone(),
             )
             .await?;
+
+        if !copied {
+            return Ok(location);
+        }
 
         // step 3: delete the staging manifest
         match store.delete(staging_manifest_path).await {
