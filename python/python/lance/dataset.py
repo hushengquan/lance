@@ -39,6 +39,7 @@ from pyarrow import RecordBatch, Schema
 from lance.log import LOGGER
 
 from .blob import BlobFile
+from .commit import ExternalManifestStore
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -424,7 +425,7 @@ class LanceDataset(pa.dataset.Dataset):
         block_size: Optional[int] = None,
         index_cache_size: Optional[int] = None,
         metadata_cache_size: Optional[int] = None,
-        commit_lock: Optional[CommitLock] = None,
+        commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
         storage_options: Optional[Dict[str, str]] = None,
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
@@ -447,6 +448,17 @@ class LanceDataset(pa.dataset.Dataset):
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+        # Handle commit_lock (can be either CommitLock or ExternalManifestStore)
+        if commit_lock:
+            # Check if it's an ExternalManifestStore using isinstance
+            if not isinstance(commit_lock, ExternalManifestStore) and not callable(
+                commit_lock
+            ):
+                raise TypeError(
+                    f"commit_lock must be a callable or ExternalManifestStore, "
+                    f"got {type(commit_lock)}"
+                )
 
         self._ds = _Dataset(
             uri,
@@ -2138,11 +2150,11 @@ class LanceDataset(pa.dataset.Dataset):
         ...             .execute(new_table)
         {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
         >>> dataset.to_table().sort_by("a").to_pandas()
-           a  b     c
-        0  1  a     x
-        1  2  x     y
-        2  3  y     z
-        3  4  z  None
+           a  b    c
+        0  1  a    x
+        1  2  x    y
+        2  3  y    z
+        3  4  z  NaN
         """
         return MergeInsertBuilder(self._ds, on)
 
@@ -3289,7 +3301,7 @@ class LanceDataset(pa.dataset.Dataset):
         base_uri: Union[str, Path],
         operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
-        commit_lock: Optional[CommitLock] = None,
+        commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
     ) -> LanceDataset:
         warnings.warn(
             "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
@@ -3302,7 +3314,7 @@ class LanceDataset(pa.dataset.Dataset):
         base_uri: Union[str, Path, LanceDataset],
         operation: Union[LanceOperation.BaseOperation, Transaction],
         read_version: Optional[int] = None,
-        commit_lock: Optional[CommitLock] = None,
+        commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
@@ -3343,9 +3355,10 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: int, optional
             The version of the dataset that was used as the base for the changes.
             This is not needed for overwrite or restore operations.
-        commit_lock : CommitLock, optional
-            A custom commit lock.  Only needed if your object store does not support
-            atomic commits.  See the user guide for more details.
+        commit_lock : CommitLock or ExternalManifestStore, optional
+            A custom commit lock or external manifest store.  Only needed if your
+            object store does not support atomic commits.  See the user guide for
+            more details.
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
@@ -3407,10 +3420,15 @@ class LanceDataset(pa.dataset.Dataset):
                 f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}"
             )
 
+        # Handle commit_lock (can be either CommitLock or ExternalManifestStore)
         if commit_lock:
-            if not callable(commit_lock):
+            # Check if it's an ExternalManifestStore using isinstance
+            if not isinstance(commit_lock, ExternalManifestStore) and not callable(
+                commit_lock
+            ):
                 raise TypeError(
-                    f"commit_lock must be a function, got {type(commit_lock)}"
+                    f"commit_lock must be a callable or ExternalManifestStore, "
+                    f"got {type(commit_lock)}"
                 )
 
         if (
@@ -3472,7 +3490,7 @@ class LanceDataset(pa.dataset.Dataset):
     def commit_batch(
         dest: Union[str, Path, LanceDataset],
         transactions: Sequence[Transaction],
-        commit_lock: Optional[CommitLock] = None,
+        commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
         storage_options: Optional[Dict[str, str]] = None,
         storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
@@ -3497,9 +3515,10 @@ class LanceDataset(pa.dataset.Dataset):
             a single transaction and applied to the dataset. Note: Only append
             transactions are currently supported. Other transaction types will be
             supported in the future.
-        commit_lock : CommitLock, optional
-            A custom commit lock.  Only needed if your object store does not support
-            atomic commits.  See the user guide for more details.
+        commit_lock : CommitLock or ExternalManifestStore, optional
+            A custom commit lock or external manifest store.  Only needed if your
+            object store does not support atomic commits.  See the user guide for
+            more details.
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
@@ -3540,10 +3559,15 @@ class LanceDataset(pa.dataset.Dataset):
                 f"base_uri must be str, Path, or LanceDataset, got {type(dest)}"
             )
 
+        # Handle commit_lock (can be either CommitLock or ExternalManifestStore)
         if commit_lock:
-            if not callable(commit_lock):
+            # Check if it's an ExternalManifestStore using isinstance
+            if not isinstance(commit_lock, ExternalManifestStore) and not callable(
+                commit_lock
+            ):
                 raise TypeError(
-                    f"commit_lock must be a function, got {type(commit_lock)}"
+                    f"commit_lock must be a callable or ExternalManifestStore, "
+                    f"got {type(commit_lock)}"
                 )
 
         new_ds, merged = _Dataset.commit_batch(
@@ -5534,7 +5558,7 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
-    commit_lock: Optional[CommitLock] = None,
+    commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
     data_storage_version: Optional[
@@ -5581,9 +5605,10 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
-    commit_lock : CommitLock, optional
-        A custom commit lock.  Only needed if your object store does not support
-        atomic commits.  See the user guide for more details.
+    commit_lock : CommitLock or ExternalManifestStore, optional
+        A custom commit lock or external manifest store.  Only needed if your
+        object store does not support atomic commits.  See the user guide for
+        more details.
     progress: FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
@@ -5806,9 +5831,16 @@ def write_dataset(
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
 
+    # Handle commit_lock (can be either CommitLock or ExternalManifestStore)
     if commit_lock:
-        if not callable(commit_lock):
-            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        # Check if it's an ExternalManifestStore using isinstance
+        if not isinstance(commit_lock, ExternalManifestStore) and not callable(
+            commit_lock
+        ):
+            raise TypeError(
+                f"commit_lock must be a callable or ExternalManifestStore, "
+                f"got {type(commit_lock)}"
+            )
         params["commit_handler"] = commit_lock
 
     if isinstance(uri, Path):

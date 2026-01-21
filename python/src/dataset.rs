@@ -80,6 +80,9 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
+use lance_table::io::commit::external_manifest::{
+    ExternalManifestCommitHandler, ExternalManifestStore,
+};
 use lance_table::io::commit::CommitHandler;
 
 use crate::error::PythonErrorExt;
@@ -95,7 +98,7 @@ use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
-use self::commit::PyCommitLock;
+use self::commit::{PyCommitLock, PyExternalManifestStore};
 use self::io_stats::IoStats;
 
 pub mod blob;
@@ -520,8 +523,26 @@ impl Dataset {
             params.store_options = Some(store_params);
         }
         if let Some(commit_handler) = commit_handler {
-            let py_commit_lock = PyCommitLock::new(commit_handler);
-            params.set_commit_lock(Arc::new(py_commit_lock));
+            // Check if it's an ExternalManifestStore by checking if it's an instance of the class
+            let handler_obj = commit_handler.bind(py);
+            let is_external_store = py
+                .import("lance.commit")
+                .and_then(|module| module.getattr("ExternalManifestStore"))
+                .and_then(|cls| handler_obj.is_instance(&cls))
+                .unwrap_or(false);
+
+            if is_external_store {
+                // It's an ExternalManifestStore, wrap it and create ExternalManifestCommitHandler
+                let py_store = PyExternalManifestStore::new(commit_handler);
+                let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(py_store) as Arc<dyn ExternalManifestStore>,
+                });
+                params.commit_handler = Some(handler);
+            } else {
+                // It's a CommitLock (legacy interface)
+                let py_commit_lock = PyCommitLock::new(commit_handler);
+                params.set_commit_lock(Arc::new(py_commit_lock));
+            }
         }
 
         // Handle read_params dict
@@ -3036,9 +3057,26 @@ pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dy
     Ok(if options.is_none() {
         None
     } else if let Ok(Some(commit_handler)) = options.get_item("commit_handler") {
-        Some(Arc::new(PyCommitLock::new(
-            commit_handler.into_pyobject(options.py())?.into(),
-        )))
+        let py = options.py();
+        let handler_obj = commit_handler.into_pyobject(py)?;
+
+        // Check if it's an ExternalManifestStore by checking if it's an instance of the class
+        let is_external_store = py
+            .import("lance.commit")
+            .and_then(|module| module.getattr("ExternalManifestStore"))
+            .and_then(|cls| handler_obj.is_instance(&cls))
+            .unwrap_or(false);
+
+        if is_external_store {
+            // It's an ExternalManifestStore, wrap it in ExternalManifestCommitHandler
+            let py_store = PyExternalManifestStore::new(handler_obj.into());
+            Some(Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(py_store) as Arc<dyn ExternalManifestStore>,
+            }))
+        } else {
+            // It's a traditional CommitLock (callable)
+            Some(Arc::new(PyCommitLock::new(handler_obj.into())))
+        }
     } else {
         None
     })

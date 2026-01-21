@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
-    from lance.commit import CommitLock
+    from lance.commit import CommitLock, ExternalManifestStore
     from lance.dependencies import pandas as pd
 
     ts_types = Union[datetime, pd.Timestamp, str]
@@ -89,7 +89,7 @@ def dataset(
     version: Optional[int | str] = None,
     asof: Optional[ts_types] = None,
     block_size: Optional[int] = None,
-    commit_lock: Optional[CommitLock] = None,
+    commit_lock: Optional[CommitLock | ExternalManifestStore] = None,
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
     default_scan_options: Optional[Dict[str, str]] = None,
@@ -117,9 +117,11 @@ def dataset(
         argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
-    commit_lock : optional, lance.commit.CommitLock
-        A custom commit lock.  Only needed if your object store does not support
-        atomic commits.  See the user guide for more details.
+    commit_lock : optional,
+        lance.commit.CommitLock or lance.commit.ExternalManifestStore.
+        A custom commit lock or external manifest store.  Only needed if your
+        object store does not support atomic commits.  See the user guide for
+        more details.
     index_cache_size : optional, int
         Index cache size. Index cache is a LRU cache with TTL. This number specifies the
         number of index pages, for example, IVF partitions, to be cached in
