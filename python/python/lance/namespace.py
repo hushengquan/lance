@@ -4,61 +4,47 @@
 """LanceNamespace storage options integration and implementations.
 
 This module provides:
-1. LanceNamespace ABC interface for namespace implementations
-2. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
-3. Storage options integration with LanceNamespace for automatic credential refresh
-4. Plugin registry for external namespace implementations
+1. Native Rust-backed namespace implementations (DirectoryNamespace, RestNamespace)
+2. Storage options integration with LanceNamespace for automatic credential refresh
+3. Plugin registry for external namespace implementations
+4. Dynamic context provider registry for per-request context injection
+
+The LanceNamespace ABC interface is provided by the lance_namespace package.
 """
 
-import importlib
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from lance_namespace_urllib3_client.models import (
-    AlterTransactionRequest,
-    AlterTransactionResponse,
-    CountTableRowsRequest,
-    CreateEmptyTableRequest,
-    CreateEmptyTableResponse,
+from lance_namespace import (
     CreateNamespaceRequest,
     CreateNamespaceResponse,
-    CreateTableIndexRequest,
-    CreateTableIndexResponse,
     CreateTableRequest,
     CreateTableResponse,
-    DeleteFromTableRequest,
-    DeleteFromTableResponse,
+    DeclareTableRequest,
+    DeclareTableResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
     DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest,
-    DescribeTableIndexStatsResponse,
     DescribeTableRequest,
     DescribeTableResponse,
-    DescribeTransactionRequest,
-    DescribeTransactionResponse,
     DropNamespaceRequest,
     DropNamespaceResponse,
     DropTableRequest,
     DropTableResponse,
-    InsertIntoTableRequest,
-    InsertIntoTableResponse,
+    LanceNamespace,
     ListNamespacesRequest,
     ListNamespacesResponse,
-    ListTableIndicesRequest,
-    ListTableIndicesResponse,
     ListTablesRequest,
     ListTablesResponse,
-    MergeInsertIntoTableRequest,
-    MergeInsertIntoTableResponse,
+    ListTableVersionsRequest,
+    ListTableVersionsResponse,
     NamespaceExistsRequest,
-    QueryTableRequest,
     RegisterTableRequest,
     RegisterTableResponse,
+    RenameTableRequest,
+    RenameTableResponse,
     TableExistsRequest,
-    UpdateTableRequest,
-    UpdateTableResponse,
 )
 
 from .io import StorageOptionsProvider
@@ -75,216 +61,150 @@ except ImportError:
     PyRestAdapter = None
 
 __all__ = [
-    # Interface and factory
-    "LanceNamespace",
-    "connect",
-    "register_namespace_impl",
-    # Implementations
     "DirectoryNamespace",
     "RestNamespace",
     "RestAdapter",
     "LanceNamespaceStorageOptionsProvider",
-    # Request/Response types (re-exported from lance_namespace_urllib3_client)
-    "AlterTransactionRequest",
-    "AlterTransactionResponse",
-    "CountTableRowsRequest",
-    "CreateEmptyTableRequest",
-    "CreateEmptyTableResponse",
-    "CreateNamespaceRequest",
-    "CreateNamespaceResponse",
-    "CreateTableIndexRequest",
-    "CreateTableIndexResponse",
-    "CreateTableRequest",
-    "CreateTableResponse",
-    "DeleteFromTableRequest",
-    "DeleteFromTableResponse",
-    "DeregisterTableRequest",
-    "DeregisterTableResponse",
-    "DescribeNamespaceRequest",
-    "DescribeNamespaceResponse",
-    "DescribeTableIndexStatsRequest",
-    "DescribeTableIndexStatsResponse",
-    "DescribeTableRequest",
-    "DescribeTableResponse",
-    "DescribeTransactionRequest",
-    "DescribeTransactionResponse",
-    "DropNamespaceRequest",
-    "DropNamespaceResponse",
-    "DropTableRequest",
-    "DropTableResponse",
-    "InsertIntoTableRequest",
-    "InsertIntoTableResponse",
-    "ListNamespacesRequest",
-    "ListNamespacesResponse",
-    "ListTableIndicesRequest",
-    "ListTableIndicesResponse",
-    "ListTablesRequest",
-    "ListTablesResponse",
-    "MergeInsertIntoTableRequest",
-    "MergeInsertIntoTableResponse",
-    "NamespaceExistsRequest",
-    "QueryTableRequest",
-    "RegisterTableRequest",
-    "RegisterTableResponse",
-    "TableExistsRequest",
-    "UpdateTableRequest",
-    "UpdateTableResponse",
+    "DynamicContextProvider",
 ]
 
 
-class LanceNamespace(ABC):
-    """Base interface for Lance Namespace implementations.
+# =============================================================================
+# Dynamic Context Provider
+# =============================================================================
 
-    This abstract base class defines the contract for namespace implementations
-    that manage Lance tables. Implementations can provide different storage backends
-    (directory-based, REST API, cloud catalogs, etc.).
 
-    To create a custom namespace implementation, subclass this ABC and implement
-    at least the `namespace_id()` method. Other methods have default implementations
-    that raise `NotImplementedError`.
+class DynamicContextProvider(ABC):
+    """Abstract base class for dynamic context providers.
+
+    Implementations provide per-request context (e.g., authentication headers)
+    based on the operation being performed. The provider is called synchronously
+    before each namespace operation.
+
+    For RestNamespace, context keys that start with `headers.` are converted to
+    HTTP headers by stripping the prefix. For example, `{"headers.Authorization":
+    "Bearer token"}` becomes the `Authorization: Bearer token` header.
+
+    Example
+    -------
+    >>> # Define a provider class
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {
+    ...             "headers.Authorization": f"Bearer {self.api_key}",
+    ...         }
+    ...
+    >>> # Create provider instance and use directly
+    >>> provider = MyProvider(api_key="secret")
+    >>> provider.provide_context({"operation": "list_tables", "object_id": "ns"})
+    {'headers.Authorization': 'Bearer secret'}
     """
 
     @abstractmethod
-    def namespace_id(self) -> str:
-        """Return a human-readable unique identifier for this namespace instance.
+    def provide_context(self, info: Dict[str, str]) -> Dict[str, str]:
+        """Provide context for a namespace operation.
 
-        This is used for equality comparison and hashing when the namespace is
-        used as part of a storage options provider. Two namespace instances with
-        the same ID are considered equal and will share cached resources.
-
-        The ID should be human-readable for debugging and logging purposes.
-        For example:
-        - REST namespace: "RestNamespace { uri: 'https://api.example.com' }"
-        - Directory namespace: "DirectoryNamespace { root: '/path/to/data' }"
+        Parameters
+        ----------
+        info : dict
+            Information about the operation:
+            - operation: The operation name (e.g., "list_tables", "describe_table")
+            - object_id: The object identifier (namespace or table ID)
 
         Returns
         -------
-        str
-            A human-readable unique identifier string
+        dict
+            Context key-value pairs. For HTTP headers, use keys with the
+            "headers." prefix (e.g., "headers.Authorization").
         """
         pass
 
-    def list_namespaces(self, request: ListNamespacesRequest) -> ListNamespacesResponse:
-        """List namespaces."""
-        raise NotImplementedError("Not supported: list_namespaces")
 
-    def describe_namespace(
-        self, request: DescribeNamespaceRequest
-    ) -> DescribeNamespaceResponse:
-        """Describe a namespace."""
-        raise NotImplementedError("Not supported: describe_namespace")
+def _create_context_provider_from_properties(
+    properties: Dict[str, str],
+) -> Optional[DynamicContextProvider]:
+    """Create a context provider instance from properties.
 
-    def create_namespace(
-        self, request: CreateNamespaceRequest
-    ) -> CreateNamespaceResponse:
-        """Create a new namespace."""
-        raise NotImplementedError("Not supported: create_namespace")
+    Extracts `dynamic_context_provider.*` properties and creates a provider
+    instance by dynamically loading the class from the given class path.
 
-    def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
-        """Drop a namespace."""
-        raise NotImplementedError("Not supported: drop_namespace")
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict that may contain dynamic_context_provider.* keys.
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
-        """Check if a namespace exists."""
-        raise NotImplementedError("Not supported: namespace_exists")
+    Returns
+    -------
+    DynamicContextProvider or None
+        The created provider instance, or None if no provider is configured.
 
-    def list_tables(self, request: ListTablesRequest) -> ListTablesResponse:
-        """List tables in a namespace."""
-        raise NotImplementedError("Not supported: list_tables")
+    Raises
+    ------
+    ValueError
+        If dynamic_context_provider.impl is set but the class cannot be loaded.
+    """
+    import importlib
 
-    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
-        """Describe a table."""
-        raise NotImplementedError("Not supported: describe_table")
+    prefix = "dynamic_context_provider."
+    impl_key = "dynamic_context_provider.impl"
 
-    def register_table(self, request: RegisterTableRequest) -> RegisterTableResponse:
-        """Register a table."""
-        raise NotImplementedError("Not supported: register_table")
+    impl_path = properties.get(impl_key)
+    if not impl_path:
+        return None
 
-    def table_exists(self, request: TableExistsRequest) -> None:
-        """Check if a table exists."""
-        raise NotImplementedError("Not supported: table_exists")
+    # Parse the class path (e.g., "my_module.submodule.MyClass")
+    if "." not in impl_path:
+        raise ValueError(
+            f"Invalid context provider class path '{impl_path}'. "
+            f"Expected format: 'module.ClassName' (e.g., 'my_module.MyProvider')"
+        )
 
-    def drop_table(self, request: DropTableRequest) -> DropTableResponse:
-        """Drop a table."""
-        raise NotImplementedError("Not supported: drop_table")
+    module_path, class_name = impl_path.rsplit(".", 1)
 
-    def deregister_table(
-        self, request: DeregisterTableRequest
-    ) -> DeregisterTableResponse:
-        """Deregister a table."""
-        raise NotImplementedError("Not supported: deregister_table")
+    try:
+        module = importlib.import_module(module_path)
+        provider_class = getattr(module, class_name)
+    except ModuleNotFoundError as e:
+        raise ValueError(
+            f"Failed to import module '{module_path}' for context provider: {e}"
+        ) from e
+    except AttributeError as e:
+        raise ValueError(
+            f"Class '{class_name}' not found in module '{module_path}': {e}"
+        ) from e
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
-        """Count rows in a table."""
-        raise NotImplementedError("Not supported: count_table_rows")
+    # Extract provider-specific properties (strip prefix, exclude impl key)
+    provider_props = {}
+    for key, value in properties.items():
+        if key.startswith(prefix) and key != impl_key:
+            prop_name = key[len(prefix) :]
+            provider_props[prop_name] = value
 
-    def create_table(
-        self, request: CreateTableRequest, request_data: bytes
-    ) -> CreateTableResponse:
-        """Create a new table with data from Arrow IPC stream."""
-        raise NotImplementedError("Not supported: create_table")
+    # Create the provider instance
+    return provider_class(**provider_props)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        """Create an empty table (metadata only operation)."""
-        raise NotImplementedError("Not supported: create_empty_table")
 
-    def insert_into_table(
-        self, request: InsertIntoTableRequest, request_data: bytes
-    ) -> InsertIntoTableResponse:
-        """Insert data into a table."""
-        raise NotImplementedError("Not supported: insert_into_table")
+def _filter_context_provider_properties(properties: Dict[str, str]) -> Dict[str, str]:
+    """Remove dynamic_context_provider.* properties from the dict.
 
-    def merge_insert_into_table(
-        self, request: MergeInsertIntoTableRequest, request_data: bytes
-    ) -> MergeInsertIntoTableResponse:
-        """Merge insert data into a table."""
-        raise NotImplementedError("Not supported: merge_insert_into_table")
+    These properties are handled at the Python level and should not be
+    passed to the Rust layer.
 
-    def update_table(self, request: UpdateTableRequest) -> UpdateTableResponse:
-        """Update a table."""
-        raise NotImplementedError("Not supported: update_table")
+    Parameters
+    ----------
+    properties : dict
+        The full properties dict.
 
-    def delete_from_table(
-        self, request: DeleteFromTableRequest
-    ) -> DeleteFromTableResponse:
-        """Delete from a table."""
-        raise NotImplementedError("Not supported: delete_from_table")
-
-    def query_table(self, request: QueryTableRequest) -> bytes:
-        """Query a table."""
-        raise NotImplementedError("Not supported: query_table")
-
-    def create_table_index(
-        self, request: CreateTableIndexRequest
-    ) -> CreateTableIndexResponse:
-        """Create a table index."""
-        raise NotImplementedError("Not supported: create_table_index")
-
-    def list_table_indices(
-        self, request: ListTableIndicesRequest
-    ) -> ListTableIndicesResponse:
-        """List table indices."""
-        raise NotImplementedError("Not supported: list_table_indices")
-
-    def describe_table_index_stats(
-        self, request: DescribeTableIndexStatsRequest
-    ) -> DescribeTableIndexStatsResponse:
-        """Describe table index statistics."""
-        raise NotImplementedError("Not supported: describe_table_index_stats")
-
-    def describe_transaction(
-        self, request: DescribeTransactionRequest
-    ) -> DescribeTransactionResponse:
-        """Describe a transaction."""
-        raise NotImplementedError("Not supported: describe_transaction")
-
-    def alter_transaction(
-        self, request: AlterTransactionRequest
-    ) -> AlterTransactionResponse:
-        """Alter a transaction."""
-        raise NotImplementedError("Not supported: alter_transaction")
+    Returns
+    -------
+    dict
+        Properties with dynamic_context_provider.* keys removed.
+    """
+    prefix = "dynamic_context_provider."
+    return {k: v for k, v in properties.items() if not k.startswith(prefix)}
 
 
 class DirectoryNamespace(LanceNamespace):
@@ -311,30 +231,92 @@ class DirectoryNamespace(LanceNamespace):
           (e.g., storage.region="us-west-2" becomes region="us-west-2" in
           storage options)
 
+        Credential vendor properties (vendor is auto-selected based on table location):
+            When credential vendor properties are configured, describe_table() will
+            return vended temporary credentials. The vendor type is auto-selected
+            based on table location URI: s3:// for AWS, gs:// for GCP, az:// for
+            Azure. Requires the corresponding credential-vendor-* feature.
+
+            Common properties:
+                - credential_vendor.enabled (required): Set to "true" to enable
+                - credential_vendor.permission (optional): read, write, or admin
+
+            AWS-specific properties (for s3:// locations):
+                - credential_vendor.aws_role_arn (required): IAM role ARN to assume
+                - credential_vendor.aws_external_id (optional): External ID
+                - credential_vendor.aws_region (optional): AWS region
+                - credential_vendor.aws_role_session_name (optional): Session name
+                - credential_vendor.aws_duration_millis (optional): Duration in ms
+                  (default: 3600000, range: 15min-12hrs)
+
+            GCP-specific properties (for gs:// locations):
+                - credential_vendor.gcp_service_account (optional): Service account
+                  to impersonate using IAM Credentials API
+
+                Note: GCP uses Application Default Credentials (ADC). To use a service
+                account key file, set the GOOGLE_APPLICATION_CREDENTIALS environment
+                variable before starting. GCP token duration cannot be configured;
+                it's determined by the STS endpoint (typically 1 hour).
+
+            Azure-specific properties (for az:// locations):
+                - credential_vendor.azure_account_name (required): Azure storage
+                  account name
+                - credential_vendor.azure_tenant_id (optional): Azure tenant ID
+                - credential_vendor.azure_duration_millis (optional): Duration in ms
+                  (default: 3600000, up to 7 days)
+
     Examples
     --------
     >>> import lance.namespace
     >>> # Create with properties dict
     >>> ns = lance.namespace.DirectoryNamespace(root="memory://test")
     >>>
-    >>> # With storage options
-    >>> ns = lance.namespace.DirectoryNamespace(
-    ...     root="/path/to/data",
-    ...     manifest_enabled="true",
-    ...     **{"storage.region": "us-west-2"}
-    ... )
+    >>> # Using the connect() factory function from lance_namespace
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("dir", {"root": "memory://test"})
     >>>
-    >>> # Using the connect() factory function
-    >>> import lance.namespace
-    >>> ns = lance.namespace.connect("dir", {"root": "memory://test"})
+    >>> # With AWS credential vending (requires credential-vendor-aws feature)
+    >>> # Use **dict to pass property names with dots
+    >>> ns = lance.namespace.DirectoryNamespace(**{
+    ...     "root": "s3://my-bucket/data",
+    ...     "credential_vendor.enabled": "true",
+    ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
+    ...     "credential_vendor.aws_duration_millis": "3600000",
+    ... })
+
+    With dynamic context provider:
+
+    >>> import tempfile
+    >>> class MyProvider(DynamicContextProvider):
+    ...     def __init__(self, token: str):
+    ...         self.token = token
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.token}"}
+    ...
+    >>> provider = MyProvider(token="secret-token")
+    >>> with tempfile.TemporaryDirectory() as tmpdir:
+    ...     ns = lance.namespace.DirectoryNamespace(
+    ...         root=tmpdir,
+    ...         context_provider=provider,
+    ...     )
+    ...     _ = ns.namespace_id()  # verify it works
     """
 
-    def __init__(self, session=None, **properties):
+    def __init__(self, session=None, context_provider=None, **properties):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyDirectoryNamespace(session=session, **str_properties)
+        self._inner = PyDirectoryNamespace(
+            session=session, context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""
@@ -401,11 +383,73 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
+
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
 
 
 class RestNamespace(LanceNamespace):
@@ -434,19 +478,28 @@ class RestNamespace(LanceNamespace):
     >>> # Create with properties dict
     >>> ns = lance.namespace.RestNamespace(uri="http://localhost:4099")
     >>>
-    >>> # With custom delimiter and headers
+    >>> # Using the connect() factory function from lance_namespace
+    >>> import lance_namespace
+    >>> ns = lance_namespace.connect("rest", {"uri": "http://localhost:4099"})
+
+    With dynamic context provider:
+
+    >>> class AuthProvider(DynamicContextProvider):
+    ...     def __init__(self, api_key: str):
+    ...         self.api_key = api_key
+    ...     def provide_context(self, info: dict) -> dict:
+    ...         return {"headers.Authorization": f"Bearer {self.api_key}"}
+    ...
+    >>> provider = AuthProvider(api_key="my-secret-key")
     >>> ns = lance.namespace.RestNamespace(
     ...     uri="http://localhost:4099",
-    ...     delimiter=".",
-    ...     **{"header.Authorization": "Bearer token"}
+    ...     context_provider=provider,
     ... )
-    >>>
-    >>> # Using the connect() factory function
-    >>> import lance.namespace
-    >>> ns = lance.namespace.connect("rest", {"uri": "http://localhost:4099"})
+    >>> ns.namespace_id()  # verify it works
+    'RestNamespace { endpoint: "http://localhost:4099", delimiter: "$" }'
     """
 
-    def __init__(self, **properties):
+    def __init__(self, context_provider=None, **properties):
         if PyRestNamespace is None:
             raise RuntimeError(
                 "RestNamespace is not available. "
@@ -456,8 +509,17 @@ class RestNamespace(LanceNamespace):
         # Convert all values to strings as expected by Rust from_properties
         str_properties = {str(k): str(v) for k, v in properties.items()}
 
+        # Create context provider from properties if configured
+        if context_provider is None:
+            context_provider = _create_context_provider_from_properties(str_properties)
+
+        # Filter out dynamic_context_provider.* properties before passing to Rust
+        filtered_properties = _filter_context_provider_properties(str_properties)
+
         # Create the underlying Rust namespace
-        self._inner = PyRestNamespace(**str_properties)
+        self._inner = PyRestNamespace(
+            context_provider=context_provider, **filtered_properties
+        )
 
     def namespace_id(self) -> str:
         """Return a human-readable unique identifier for this namespace instance."""
@@ -524,11 +586,77 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.create_table(request.model_dump(), request_data)
         return CreateTableResponse.from_dict(response_dict)
 
-    def create_empty_table(
-        self, request: CreateEmptyTableRequest
-    ) -> CreateEmptyTableResponse:
-        response_dict = self._inner.create_empty_table(request.model_dump())
-        return CreateEmptyTableResponse.from_dict(response_dict)
+    def declare_table(self, request: DeclareTableRequest) -> DeclareTableResponse:
+        response_dict = self._inner.declare_table(request.model_dump())
+        return DeclareTableResponse.from_dict(response_dict)
+
+    def rename_table(self, request: RenameTableRequest) -> RenameTableResponse:
+        response_dict = self._inner.rename_table(request.model_dump())
+        return RenameTableResponse.from_dict(response_dict)
+
+    # Table version operations
+
+    def list_table_versions(
+        self, request: ListTableVersionsRequest
+    ) -> ListTableVersionsResponse:
+        response_dict = self._inner.list_table_versions(request.model_dump())
+        return ListTableVersionsResponse.from_dict(response_dict)
+
+    def create_table_version(self, request: dict) -> dict:
+        """Create a table version (for external manifest store integration).
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int - Version number to create
+            - manifest_path: str - Path to staging manifest
+            - manifest_size: int (optional) - Size in bytes
+            - e_tag: str (optional) - ETag for optimistic concurrency
+
+        Returns
+        -------
+        dict
+            Response dictionary with optional transaction_id
+        """
+        return self._inner.create_table_version(request)
+
+    def describe_table_version(self, request: dict) -> dict:
+        """Describe a specific table version.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - version: int (optional) - Version to describe (None = latest)
+
+        Returns
+        -------
+        dict
+            Response dictionary with version info:
+            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        """
+        return self._inner.describe_table_version(request)
+
+    def batch_delete_table_versions(self, request: dict) -> dict:
+        """Delete multiple table versions in a single request.
+
+        Parameters
+        ----------
+        request : dict
+            Request dictionary with keys:
+            - id: List[str] - Table identifier
+            - versions: List[int] - List of version numbers to delete
+
+        Returns
+        -------
+        dict
+            Response dictionary with:
+            - deleted_versions: List[int] - List of successfully deleted versions
+        """
+        return self._inner.batch_delete_table_versions(request)
 
 
 class RestAdapter:
@@ -553,19 +681,21 @@ class RestAdapter:
     session : Session, optional
         Lance session for sharing object store connections with the backend namespace.
     host : str, optional
-        Host address to bind to, default "127.0.0.1"
+        Host address to bind to. Default "127.0.0.1".
     port : int, optional
-        Port to listen on, default 2333
+        Port to listen on. Default 2333 per REST spec.
+        Use 0 to let the OS assign an available ephemeral port.
+        Use the `port` property after `start()` to get the actual port.
 
     Examples
     --------
     >>> import lance.namespace
     >>>
-    >>> # Start REST adapter with DirectoryNamespace backend
+    >>> # Start REST adapter with DirectoryNamespace backend (auto port)
     >>> namespace_config = {"root": "memory://test"}
-    >>> with lance.namespace.RestAdapter("dir", namespace_config, port=4001) as adapter:
-    ...     # Create REST client
-    ...     client = lance.namespace.RestNamespace(uri="http://127.0.0.1:4001")
+    >>> with lance.namespace.RestAdapter("dir", namespace_config) as adapter:
+    ...     # Create REST client using the assigned port
+    ...     client = lance.namespace.RestNamespace(uri=f"http://127.0.0.1:{adapter.port}")
     ...     # Use the client...
     """
 
@@ -574,8 +704,8 @@ class RestAdapter:
         namespace_impl: str,
         namespace_properties: Dict[str, str] = None,
         session=None,
-        host: str = "127.0.0.1",
-        port: int = 2333,
+        host: str = None,
+        port: int = None,
     ):
         if PyRestAdapter is None:
             raise RuntimeError(
@@ -592,12 +722,19 @@ class RestAdapter:
         # Create the underlying Rust adapter
         self._inner = PyRestAdapter(namespace_impl, str_properties, session, host, port)
         self.host = host
-        self.port = port
         self.namespace_impl = namespace_impl
 
-    def serve(self):
+    @property
+    def port(self) -> int:
+        """Get the actual port the server is listening on.
+
+        Returns 0 if the server hasn't been started yet.
+        """
+        return self._inner.port
+
+    def start(self):
         """Start the REST server in the background."""
-        self._inner.serve()
+        self._inner.start()
 
     def stop(self):
         """Stop the REST server."""
@@ -605,7 +742,7 @@ class RestAdapter:
 
     def __enter__(self):
         """Start server when entering context."""
-        self.serve()
+        self.start()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -678,18 +815,20 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
         """Fetch storage options from the namespace.
 
         This calls namespace.describe_table() to get the latest storage options
-        and their expiration time.
+        and optionally their expiration time.
 
         Returns
         -------
         Dict[str, str]
-            Flat dictionary of string key-value pairs containing storage options
-            and expires_at_millis
+            Flat dictionary of string key-value pairs containing storage options.
+            May optionally include expires_at_millis. If expires_at_millis is not
+            provided, credentials are treated as non-expiring and will not be
+            automatically refreshed.
 
         Raises
         ------
         RuntimeError
-            If the namespace doesn't return storage options or expiration time
+            If the namespace doesn't return storage options
         """
         request = DescribeTableRequest(id=self._table_id, version=None)
         response = self._namespace.describe_table(request)
@@ -700,14 +839,9 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
                 "Ensure the namespace supports storage options providing."
             )
 
-        # Verify expires_at_millis is present
-        if "expires_at_millis" not in storage_options:
-            raise RuntimeError(
-                "Namespace storage_options missing 'expires_at_millis'. "
-                "Storage options refresh will not work properly."
-            )
-
         # Return the storage_options directly - it's already a flat Map<String, String>
+        # Note: expires_at_millis is optional. If not provided, credentials are treated
+        # as non-expiring and will not be automatically refreshed.
         return storage_options
 
     def provider_id(self) -> str:
@@ -732,76 +866,3 @@ class LanceNamespaceStorageOptionsProvider(StorageOptionsProvider):
             f"LanceNamespaceStorageOptionsProvider {{ "
             f"namespace: {namespace_id}, table_id: {self._table_id!r} }}"
         )
-
-
-# Native implementations (Rust-backed)
-NATIVE_IMPLS = {
-    "rest": "lance.namespace.RestNamespace",
-    "dir": "lance.namespace.DirectoryNamespace",
-}
-
-# Plugin registry for external implementations
-_REGISTERED_IMPLS: Dict[str, str] = {}
-
-
-def register_namespace_impl(name: str, class_path: str) -> None:
-    """Register a namespace implementation with a short name.
-
-    External libraries can use this to register their implementations,
-    allowing users to use short names like "glue" instead of full class paths.
-
-    Parameters
-    ----------
-    name : str
-        Short name for the implementation (e.g., "glue", "hive2", "unity")
-    class_path : str
-        Full class path (e.g., "lance_glue.GlueNamespace")
-    """
-    _REGISTERED_IMPLS[name] = class_path
-
-
-def connect(impl: str, properties: Dict[str, str]) -> LanceNamespace:
-    """Connect to a Lance namespace implementation.
-
-    This factory function creates namespace instances based on implementation
-    aliases or full class paths. It provides a unified way to instantiate
-    different namespace backends.
-
-    Parameters
-    ----------
-    impl : str
-        Implementation alias or full class path. Built-in aliases:
-        - "rest": RestNamespace (REST API client)
-        - "dir": DirectoryNamespace (local/cloud filesystem)
-        You can also use full class paths like "my.custom.Namespace"
-        External libraries can register additional aliases using
-        `register_namespace_impl()`.
-    properties : Dict[str, str]
-        Configuration properties passed to the namespace constructor
-
-    Returns
-    -------
-    LanceNamespace
-        The connected namespace instance
-
-    Raises
-    ------
-    ValueError
-        If the implementation class cannot be loaded or does not
-        implement LanceNamespace interface
-    """
-    # Check native impls first, then registered plugins, then treat as full class path
-    impl_class = NATIVE_IMPLS.get(impl) or _REGISTERED_IMPLS.get(impl) or impl
-    try:
-        module_name, class_name = impl_class.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        namespace_class = getattr(module, class_name)
-
-        if not issubclass(namespace_class, LanceNamespace):
-            raise ValueError(
-                f"Class {impl_class} does not implement LanceNamespace interface"
-            )
-
-        return namespace_class(**properties)
-    except Exception as e:
-        raise ValueError(f"Failed to construct namespace impl {impl_class}: {e}")

@@ -5,20 +5,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
+    JNIEnvExt, RT,
     error::{Error, Result},
     traits::IntoJava,
-    JNIEnvExt, RT,
 };
 use arrow::{
     array::{RecordBatch, StructArray},
-    ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type},
 };
 use arrow_schema::DataType;
 use jni::objects::JMap;
 use jni::{
+    JNIEnv,
     objects::{JObject, JString},
     sys::jlong,
-    JNIEnv,
 };
 use lance::io::ObjectStore;
 use lance_file::{
@@ -62,7 +62,7 @@ fn create_java_writer_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
     Ok(res)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
     mut env: JNIEnv<'local>,
     _writer_class: JObject,
@@ -94,7 +94,9 @@ fn inner_open<'local>(
 
     let writer = RT.block_on(async move {
         let object_params = ObjectStoreParams {
-            storage_options: Some(storage_options),
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+            )),
             ..Default::default()
         };
         let (obj_store, path) = ObjectStore::from_uri_and_params(
@@ -122,7 +124,7 @@ fn inner_open<'local>(
     writer.into_java(env)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,
@@ -149,7 +151,36 @@ pub extern "system" fn Java_org_lance_file_LanceFileWriter_closeNative<'local>(
     JObject::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_file_LanceFileWriter_nativeAddSchemaMetadata<'local>(
+    mut env: JNIEnv<'local>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> JObject<'local> {
+    if let Err(e) = inner_add_schema_metadata(&mut env, writer, schema_metadata) {
+        e.throw(&mut env);
+        return JObject::null();
+    }
+    JObject::null()
+}
+
+fn inner_add_schema_metadata(
+    env: &mut JNIEnv<'_>,
+    writer: JObject,
+    schema_metadata: JObject, // Map<String, String>
+) -> Result<()> {
+    let metadata_map = JMap::from_env(env, &schema_metadata)?;
+    let metadata = to_rust_map(env, &metadata_map)?;
+    let writer_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingFileWriter>(writer, NATIVE_WRITER) }?;
+    let mut writer = writer_guard.inner.lock().unwrap();
+    metadata.into_iter().for_each(|(k, v)| {
+        writer.add_schema_metadata(k, v);
+    });
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_file_LanceFileWriter_writeNative<'local>(
     mut env: JNIEnv<'local>,
     writer: JObject,

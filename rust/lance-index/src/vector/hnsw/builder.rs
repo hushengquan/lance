@@ -14,33 +14,32 @@ use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use snafu::location;
 use std::cmp::min;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::iter;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
+use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
-use crate::vector::graph::{greedy_search, Visited};
 use crate::vector::graph::{
-    Graph, OrderedFloat, OrderedNode, VisitedGenerator, DISTS_FIELD, NEIGHBORS_COL, NEIGHBORS_FIELD,
+    DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode, VisitedGenerator,
 };
+use crate::vector::graph::{Visited, greedy_search};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
+use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
@@ -243,39 +242,59 @@ impl HNSW {
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
-        let node_ids = storage
-            .row_ids()
-            .enumerate()
-            .filter_map(|(node_id, _)| {
-                prefilter_bitset
-                    .contains(node_id as u32)
-                    .then_some(node_id as u32)
-            })
-            .collect_vec();
-
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
-        for i in 0..node_ids.len() {
-            if let Some(ahead) = self.inner.params.prefetch_distance {
-                if i + ahead < node_ids.len() {
-                    dist_calc.prefetch(node_ids[i + ahead]);
+
+        match self.inner.params.prefetch_distance {
+            Some(ahead) if ahead > 0 => {
+                let mut ids_iter = prefilter_bitset.iter_ones().map(|i| i as u32);
+                let mut buffer = VecDeque::with_capacity(ahead + 1);
+                for _ in 0..=ahead {
+                    if let Some(id) = ids_iter.next() {
+                        buffer.push_back(id);
+                    } else {
+                        break;
+                    }
+                }
+
+                while let Some(node_id) = buffer.pop_front() {
+                    if let Some(&prefetch_id) = buffer.get(ahead - 1) {
+                        dist_calc.prefetch(prefetch_id);
+                    }
+                    if let Some(next) = ids_iter.next() {
+                        buffer.push_back(next);
+                    }
+
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
                 }
             }
-            let node_id = node_ids[i];
-            let dist: OrderedFloat = dist_calc.distance(node_id).into();
-            if dist <= lower_bound || dist > upper_bound {
-                continue;
+            _ => {
+                for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
+                    let dist: OrderedFloat = dist_calc.distance(node_id).into();
+                    if dist <= lower_bound || dist > upper_bound {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push((dist, node_id).into());
+                    } else if dist < heap.peek().unwrap().dist {
+                        heap.pop();
+                        heap.push((dist, node_id).into());
+                    }
+                }
             }
-            if heap.len() < k {
-                heap.push((dist, node_id).into());
-            } else if dist < heap.peek().unwrap().dist {
-                heap.pop();
-                heap.push((dist, node_id).into());
-            }
-        }
+        };
         heap.into_sorted_vec()
     }
 
@@ -584,22 +603,17 @@ impl IvfSubIndex for HNSW {
             return Ok(Self::empty());
         }
 
-        let hnsw_metadata =
-            data.schema_ref()
-                .metadata()
-                .get(HNSW_METADATA_KEY)
-                .ok_or(Error::Index {
-                    message: format!("{} not found", HNSW_METADATA_KEY),
-                    location: location!(),
-                })?;
-        let hnsw_metadata: HnswMetadata =
-            serde_json::from_str(hnsw_metadata).map_err(|e| Error::Index {
-                message: format!(
-                    "Failed to decode HNSW metadata: {}, json: {}",
-                    e, hnsw_metadata
-                ),
-                location: location!(),
-            })?;
+        let hnsw_metadata = data
+            .schema_ref()
+            .metadata()
+            .get(HNSW_METADATA_KEY)
+            .ok_or(Error::index(format!("{} not found", HNSW_METADATA_KEY)))?;
+        let hnsw_metadata: HnswMetadata = serde_json::from_str(hnsw_metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {}, json: {}",
+                e, hnsw_metadata
+            ))
+        })?;
 
         let levels: Vec<_> = hnsw_metadata
             .level_offsets
@@ -685,10 +699,9 @@ impl IvfSubIndex for HNSW {
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
-            return Err(Error::Index {
-                message: "ef must be greater than or equal to k".to_string(),
-                location: location!(),
-            });
+            return Err(Error::index(
+                "ef must be greater than or equal to k".to_string(),
+            ));
         }
 
         let schema = VECTOR_RESULT_SCHEMA.clone();
@@ -859,8 +872,8 @@ mod tests {
         flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{
-            builder::{HnswBuildParams, HnswQueryParams},
             HNSW, VECTOR_ID_FIELD,
+            builder::{HnswBuildParams, HnswQueryParams},
         },
     };
 
