@@ -53,6 +53,7 @@ cmake-build-*
 .vscode
 .DS_Store
 .metals
+.codebuddy
 
 python/lance/_*.cpp
 

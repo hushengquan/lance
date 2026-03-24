@@ -9,8 +9,8 @@ use crate::vector::shared::partition_merger::{
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt64Array};
-use futures::StreamExt as _;
+use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use futures::{StreamExt as _, TryStreamExt as _};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID_FIELD, Result};
@@ -286,7 +286,6 @@ pub async fn write_partition_rows(
         4,
         lance_encoding::decoder::FilterExpression::no_filter(),
     )?;
-    use futures::StreamExt as _;
     while let Some(rb) = stream.next().await {
         let rb = rb?;
         w.write_batch(&rb).await?;
@@ -412,30 +411,43 @@ async fn compute_shard_content_key(
     let mut min_fragment_id: Option<u32> = None;
     let mut min_row_id: Option<u64> = None;
 
-    let mut offset: usize = 0;
-    for len in &lengths {
-        let part_len = *len as usize;
-        if part_len > 0 {
-            let mut stream = reader.read_stream(
-                lance_io::ReadBatchParams::Range(offset..offset + 1),
-                u32::MAX,
-                4,
-                lance_encoding::decoder::FilterExpression::no_filter(),
-            )?;
-            if let Some(batch_res) = stream.next().await {
-                let batch = batch_res?;
-                if batch.num_rows() > 0 {
-                    let arr = batch
-                        .column(row_id_idx)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            Error::index(
-                                "ROW_ID_FIELD must be a UInt64 column in auxiliary shard"
-                                    .to_string(),
-                            )
-                        })?;
-                    let row_id_val = arr.value(0);
+    // Collect the first-row offset of each non-empty partition, then read them
+    // all in a single batched I/O instead of one read_stream per partition.
+    let first_row_offsets: Vec<u32> = {
+        let mut offsets = Vec::new();
+        let mut offset: usize = 0;
+        for len in &lengths {
+            let part_len = *len as usize;
+            if part_len > 0 {
+                offsets.push(offset as u32);
+            }
+            offset += part_len;
+        }
+        offsets
+    };
+
+    if !first_row_offsets.is_empty() {
+        let indices = UInt32Array::from(first_row_offsets);
+        let mut stream = reader.read_stream(
+            lance_io::ReadBatchParams::Indices(indices),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )?;
+        while let Some(batch_res) = stream.next().await {
+            let batch = batch_res?;
+            if batch.num_rows() > 0 {
+                let arr = batch
+                    .column(row_id_idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        Error::index(
+                            "ROW_ID_FIELD must be a UInt64 column in auxiliary shard".to_string(),
+                        )
+                    })?;
+                for i in 0..arr.len() {
+                    let row_id_val = arr.value(i);
                     let frag_id = decode_fragment_id_from_row_id(row_id_val);
                     min_fragment_id = Some(match min_fragment_id {
                         Some(cur) => cur.min(frag_id),
@@ -448,7 +460,6 @@ async fn compute_shard_content_key(
                 }
             }
         }
-        offset += part_len;
     }
 
     let min_fragment_id = min_fragment_id.unwrap_or(RowAddress::TOMBSTONE_FRAG);
@@ -775,15 +786,26 @@ pub async fn merge_partial_vector_auxiliary_files(
         SchedulerConfig::max_bandwidth(object_store),
     );
 
-    // Compute content-derived sort keys for each shard once while opening the
-    // auxiliary readers. These keys will be reused both for ordering the
-    // enumeration of shards and for per-partition writes.
+    // Compute content-derived sort keys for each shard in parallel while
+    // opening the auxiliary readers.  These keys will be reused both for
+    // ordering the enumeration of shards and for per-partition writes.
+    let object_store_arc = Arc::new(object_store.clone());
+    let shard_key_futures = aux_paths.into_iter().map(|aux| {
+        let sched = sched.clone();
+        let store = object_store_arc.clone();
+        async move {
+            let key = compute_shard_content_key(&sched, &store, &aux).await?;
+            Ok::<_, Error>((aux, key))
+        }
+    });
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(4);
     let mut shard_keys: Vec<(object_store::path::Path, (u32, u64, String))> =
-        Vec::with_capacity(aux_paths.len());
-    for aux in aux_paths.into_iter() {
-        let key = compute_shard_content_key(&sched, object_store, &aux).await?;
-        shard_keys.push((aux, key));
-    }
+        futures::stream::iter(shard_key_futures)
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
 
     // Sort shards by their content-derived keys (min_fragment_id, min_row_id,
     // parent_dir_name) to detach from underlying listing order.
