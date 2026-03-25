@@ -13,7 +13,6 @@ use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::IndexMetadata as IndexMetaSchema;
@@ -281,29 +280,6 @@ pub async fn init_writer_for_sq(
     let meta_json = serde_json::to_string(sq_meta)?;
     init_writer_for_storage(&mut w, dt, &meta_json, SQ_METADATA_KEY)?;
     Ok(w)
-}
-
-/// Stream and write a range of rows from reader into writer.
-///
-/// The caller is responsible for ensuring that `range` corresponds to a
-/// contiguous row interval for a single IVF partition.
-pub async fn write_partition_rows(
-    reader: &V2Reader,
-    w: &mut FileWriter,
-    range: Range<usize>,
-) -> Result<()> {
-    let mut stream = reader.read_stream(
-        lance_io::ReadBatchParams::Range(range),
-        u32::MAX,
-        4,
-        lance_encoding::decoder::FilterExpression::no_filter(),
-    )?;
-    use futures::StreamExt as _;
-    while let Some(rb) = stream.next().await {
-        let rb = rb?;
-        w.write_batch(&rb).await?;
-    }
-    Ok(())
 }
 
 /// Transpose the PQ code column for a batch and write it to the unified writer.
@@ -1243,16 +1219,36 @@ pub async fn merge_partial_vector_auxiliary_files(
             }
         }
         _ => {
-            for pid in 0..nlist {
-                for shard in shard_infos.iter() {
-                    let part_len = shard.lengths[pid] as usize;
-                    if part_len == 0 {
-                        continue;
-                    }
-                    let offset = shard.partition_offsets[pid];
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows(shard.reader.as_ref(), w, offset..offset + part_len)
-                            .await?;
+            // Use the same windowed parallel I/O as PQ path for all non-PQ
+            // index types (IVF_FLAT, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_SQ).
+            // This reduces I/O calls from nlist*shards serial reads to
+            // ceil(nlist/window)*shards parallel reads with prefetch.
+            let partition_window_size = *PARTITION_WINDOW_SIZE;
+            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
+            let mut shard_merge_reader = ShardMergeReader::new(
+                shard_infos,
+                nlist,
+                partition_window_size,
+                prefetch_window_count,
+            );
+
+            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
+                if accumulated_lengths[pid] == 0 {
+                    continue;
+                }
+                if batches.is_empty() {
+                    return Err(Error::index(format!(
+                        "No merged batches found for non-empty partition {}",
+                        pid
+                    )));
+                }
+                if let Some(w) = v2w_opt.as_mut() {
+                    let schema = batches[0].schema();
+                    let merged = concat_batches(&schema, batches.iter())?;
+                    let batch_size: usize = 10_240;
+                    for offset in (0..merged.num_rows()).step_by(batch_size) {
+                        let len = std::cmp::min(batch_size, merged.num_rows() - offset);
+                        w.write_batch(&merged.slice(offset, len)).await?;
                     }
                 }
             }
