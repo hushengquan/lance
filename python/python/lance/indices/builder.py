@@ -65,6 +65,7 @@ class IndicesBuilder:
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        target_partition_size: Optional[int] = None,
     ) -> IvfModel:
         """
         Train IVF centroids for the given vector column.
@@ -83,7 +84,8 @@ class IndicesBuilder:
         Parameters
         ----------
 
-        num_partitions: int
+        num_partitions: int, optional
+            Deprecated. Use ``target_partition_size`` instead.
             The number of partitions to train.  Large values are more expensive to
             train and can lead to longer search times.  Smaller values could lead to
             overtraining, reduced recall, and require large nprobes values.  If not
@@ -105,9 +107,26 @@ class IndicesBuilder:
             some cases, k-means will not converge but will cycle between various
             possible minima.  In these cases we must terminate or run forever.  The
             max_iters parameter defines a cutoff at which we terminate training.
+        target_partition_size: int, optional
+            The target number of rows per partition.  If set, ``num_partitions`` will
+            be computed automatically as ``num_rows / target_partition_size`` (clamped
+            to [1, 4096]).  Mutually exclusive with ``num_partitions``.
         """
+        if num_partitions is not None and target_partition_size is not None:
+            raise ValueError(
+                "num_partitions and target_partition_size are mutually exclusive. "
+                "Please specify only one of them."
+            )
+        if num_partitions is not None:
+            warnings.warn(
+                "num_partitions is deprecated, use target_partition_size instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         num_rows = self.dataset.count_rows()
-        num_partitions = self._determine_num_partitions(num_partitions, num_rows)
+        num_partitions = self._determine_num_partitions(
+            num_partitions, num_rows, target_partition_size
+        )
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
@@ -205,13 +224,14 @@ class IndicesBuilder:
 
     def prepare_global_ivf_pq(
         self,
-        num_partitions: Optional[int],
-        num_subvectors: Optional[int],
+        num_partitions: Optional[int] = None,
+        num_subvectors: Optional[int] = None,
         *,
         distance_type: str = "l2",
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        target_partition_size: Optional[int] = None,
     ) -> dict:
         """
         Perform global training for IVF+PQ using existing CPU training paths and
@@ -238,6 +258,7 @@ class IndicesBuilder:
             accelerator=accelerator,  # None by default (CPU path)
             sample_rate=sample_rate,
             max_iters=max_iters,
+            target_partition_size=target_partition_size,
         )
 
         # Global PQ training using IVF residuals
@@ -453,10 +474,20 @@ class IndicesBuilder:
         else:
             raise ValueError("filenames must be a list of strings")
 
-    def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
-        if num_partitions is None:
-            return round(math.sqrt(num_rows))
-        return num_partitions
+    def _determine_num_partitions(
+        self,
+        num_partitions: Optional[int],
+        num_rows: int,
+        target_partition_size: Optional[int] = None,
+    ):
+        if num_partitions is not None:
+            return num_partitions
+        if target_partition_size is not None:
+            # Consistent with Rust recommended_num_partitions:
+            # clamp(num_rows / target_partition_size, 1, 4096)
+            MAX_PARTITIONS = 4096
+            return max(1, min(num_rows // target_partition_size, MAX_PARTITIONS))
+        return round(math.sqrt(num_rows))
 
     def _normalize_pq_params(self, num_subvectors: int, dimension: int):
         if num_subvectors is None:
