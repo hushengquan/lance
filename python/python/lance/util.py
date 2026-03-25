@@ -253,5 +253,11 @@ def _target_partition_size_to_num_partitions(
 ) -> int:
     if target_partition_size is None:
         target_partition_size = 8192
+    if target_partition_size <= 0:
+        raise ValueError(
+            "target_partition_size must be a positive integer, "
+            f"got {target_partition_size}"
+        )
+    MAX_PARTITIONS = 4096
     num_partitions = num_rows // target_partition_size
-    return max(1, num_partitions, 4096)
+    return max(1, min(num_partitions, MAX_PARTITIONS))

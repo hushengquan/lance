@@ -2259,12 +2259,15 @@ def assert_distributed_vector_consistency(
     safe_sr_pq = num_rows // 256
     safe_sr = max(2, min(safe_sr_ivf, safe_sr_pq))
 
+    # Convert num_partitions to target_partition_size (num_partitions is deprecated)
+    tps = num_rows // nparts if nparts else None
+
     if index_type in {"IVF_PQ", "IVF_HNSW_PQ"}:
         preprocessed = builder.prepare_global_ivf_pq(
-            nparts,
-            nsub,
+            num_subvectors=nsub,
             distance_type=dist_type,
             sample_rate=safe_sr,
+            target_partition_size=tps,
         )
     elif (
         ("IVF_FLAT" in index_type)
@@ -2272,9 +2275,9 @@ def assert_distributed_vector_consistency(
         or ("IVF_HNSW_FLAT" in index_type)
     ):
         ivf_model = builder.train_ivf(
-            nparts,
             distance_type=dist_type,
             sample_rate=safe_sr,
+            target_partition_size=tps,
         )
         preprocessed = {"ivf_centroids": ivf_model.centroids}
 
@@ -2393,11 +2396,11 @@ def test_prepared_global_ivfpq_distributed_merge_and_search(tmp_path: Path):
     # Global preparation
     builder = IndicesBuilder(ds, "vector")
     preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=4,
         distance_type="l2",
         sample_rate=3,
         max_iters=20,
+        target_partition_size=500,
     )
 
     # Distributed build using prepared centroids/codebook
@@ -2423,11 +2426,11 @@ def test_consistency_improves_with_preprocessed_centroids(tmp_path: Path):
 
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=16,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=500,
     )
 
     # Build single-machine index as ground truth target index
@@ -2488,11 +2491,11 @@ def test_metadata_merge_pq_success(tmp_path):
     node2 = [f.fragment_id for f in frags[mid:]]
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=8,
         num_subvectors=16,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=250,
     )
     try:
         segments = _build_segments(
@@ -2527,11 +2530,11 @@ def test_distributed_workflow_merge_and_search(tmp_path):
     node2 = [f.fragment_id for f in frags[mid:]]
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=4,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=500,
     )
     try:
         segments = _build_segments(
@@ -2563,11 +2566,11 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
     # Global preparation
     builder = IndicesBuilder(ds, "vector")
     preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=4,
         distance_type="l2",
         sample_rate=3,
         max_iters=20,
+        target_partition_size=250,
     )
 
     segments = _build_segments(
@@ -2604,11 +2607,11 @@ def test_distributed_ivf_parameterized(tmp_path, index_type, num_sub_vectors):
     node2 = [f.fragment_id for f in frags[mid:]]
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=num_sub_vectors,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=500,
     )
 
     try:
@@ -2659,11 +2662,11 @@ def test_merge_two_shards_parameterized(tmp_path, index_type, num_sub_vectors):
     shard2 = [frags[1].fragment_id]
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=num_sub_vectors,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=500,
     )
 
     base_kwargs = {
@@ -2713,11 +2716,11 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
     assert len(frags) >= 2
     builder = IndicesBuilder(ds, "vector")
     preprocessed = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=4,
         distance_type="l2",
         sample_rate=7,
         max_iters=20,
+        target_partition_size=500,
     )
 
     segments = [
@@ -2756,10 +2759,10 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     # Global IVF+PQ training once; artifacts are reused across shard orders.
     builder = IndicesBuilder(ds, "vector")
     pre = builder.prepare_global_ivf_pq(
-        num_partitions=4,
         num_subvectors=16,
         distance_type="l2",
         sample_rate=7,
+        target_partition_size=500,
     )
 
     # Copy the dataset twice so index manifests do not clash and we can vary

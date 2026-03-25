@@ -126,10 +126,61 @@ def test_ivf_centroids_distance_type(tmpdir, rand_dataset):
 
 
 def test_num_partitions(rand_dataset):
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
-        sample_rate=16, num_partitions=10
-    )
+    with pytest.warns(DeprecationWarning, match="num_partitions is deprecated"):
+        ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, num_partitions=10
+        )
     assert ivf.num_partitions == 10
+
+
+def test_target_partition_size(rand_dataset):
+    # NUM_ROWS=30000, target_partition_size=10000 => 30000//10000 = 3 partitions
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        sample_rate=16, target_partition_size=10000
+    )
+    assert ivf.num_partitions == 3
+
+
+def test_target_partition_size_and_num_partitions_mutually_exclusive(rand_dataset):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, num_partitions=10, target_partition_size=1000
+        )
+
+
+def test_target_partition_size_zero_raises(rand_dataset):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, target_partition_size=0
+        )
+
+
+def test_target_partition_size_negative_raises(rand_dataset):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, target_partition_size=-1
+        )
+
+
+def test_num_partitions_deprecation_warning(rand_dataset):
+    with pytest.warns(DeprecationWarning, match="num_partitions is deprecated"):
+        IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, num_partitions=10
+        )
+
+
+def test_target_partition_size_clamp_upper(rand_dataset):
+    # target_partition_size=1 => 30000//1 = 30000, clamped to 4096
+    builder = IndicesBuilder(rand_dataset, "vectors")
+    num_partitions = builder._determine_num_partitions(None, 30000, 1)
+    assert num_partitions == 4096
+
+
+def test_target_partition_size_clamp_lower(rand_dataset):
+    # target_partition_size larger than num_rows => 30000//100000 = 0, clamped to 1
+    builder = IndicesBuilder(rand_dataset, "vectors")
+    num_partitions = builder._determine_num_partitions(None, 30000, 100000)
+    assert num_partitions == 1
 
 
 @pytest.fixture
