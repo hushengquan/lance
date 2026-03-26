@@ -1978,8 +1978,8 @@ async fn list_page_lookup_files(
 ///
 /// In a distributed environment, each worker node writes partition page / lookup file for the partitions it processes,
 /// and this function merges these files into a final metadata file.
-/// - For fragment-based indices, it performs a full K-way sort-merge of page files to create new global page and lookup files.
-/// - For range-based indices, it concatenates lookup files, as data is already globally sorted.
+/// Both fragment-based and range-based indices concatenate lookup files and keep
+/// page_data files untouched, using `ranges_to_files` metadata for page dispatch at load time.
 async fn merge_metadata_files(
     store: &dyn IndexStore,
     part_page_files: &[String],
@@ -2147,69 +2147,59 @@ async fn merge_range_partitioned_lookups(
     Ok(())
 }
 
-/// Merges partition files using a K-way sort-merge algorithm.
+/// Merges fragment-partitioned lookup files without rewriting page_data files.
 ///
-/// This function assumes its inputs have been pre-validated. It reads from all
-/// partitioned page files simultaneously, merges them into a single sorted stream,
-/// writes a new global page file, and generates a corresponding global lookup file.
+/// This optimization avoids the expensive K-way sort-merge of all page_data.
+/// Instead, it concatenates lookup entries from each partition (with remapped page_idx),
+/// and writes `ranges_to_files` metadata so the load path can dispatch page reads
+/// to the correct partition file via `LazyRangedIndexReader`.
+///
+/// The page_data files are kept as-is. The BTreeLookup naturally supports overlapping
+/// page ranges, so queries remain correct even without global sorting.
 #[allow(clippy::too_many_arguments)]
 async fn merge_pages_and_lookups(
     store: &dyn IndexStore,
-    part_page_files: &[String],
+    _part_page_files: &[String],
     part_lookup_files: &[String],
-    page_files_map: &HashMap<u64, &String>,
+    _page_files_map: &HashMap<u64, &String>,
     lookup_schema: Arc<Schema>,
-    metadata: HashMap<String, String>,
+    mut metadata: HashMap<String, String>,
     batch_size: u64,
     batch_readhead: Option<usize>,
 ) -> Result<()> {
-    // Create a new global page file
-    let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
-    let page_file = page_files_map.get(&partition_id).unwrap();
-    let page_reader = store.open_index_file(page_file).await?;
-    let page_schema = page_reader.schema().clone();
-
-    let arrow_schema = Arc::new(Schema::from(&page_schema));
-    let mut page_file = store
-        .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
-        .await?;
-
-    let lookup_entries = merge_pages(
-        part_lookup_files,
-        page_files_map,
-        store,
-        batch_size,
-        &mut page_file,
-        arrow_schema.clone(),
-        batch_readhead,
-    )
-    .await?;
-    page_file.finish().await?;
-
-    let lookup_batch = RecordBatch::try_new(
-        lookup_schema.clone(),
-        vec![
-            ScalarValue::iter_to_array(lookup_entries.iter().map(|(min, _, _, _)| min.clone()))?,
-            ScalarValue::iter_to_array(lookup_entries.iter().map(|(_, max, _, _)| max.clone()))?,
-            Arc::new(UInt32Array::from_iter_values(
-                lookup_entries
-                    .iter()
-                    .map(|(_, _, null_count, _)| *null_count),
-            )),
-            Arc::new(UInt32Array::from_iter_values(
-                lookup_entries.iter().map(|(_, _, _, page_idx)| *page_idx),
-            )),
-        ],
-    )?;
+    let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
-    lookup_file.write_record_batch(lookup_batch).await?;
+
+    let mut pages_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
+    let mut num_pages_written = 0u32;
+
+    for (part_id, part_lookup_file) in &sorted_part_lookup_files {
+        let lookup_reader = store.open_index_file(part_lookup_file).await?;
+        let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
+        let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
+        while let Some(batch) = stream.next().await {
+            let original_batch = batch?;
+            let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
+            lookup_file.write_record_batch(modified_batch).await?;
+        }
+        pages_per_file.push((*part_id, lookup_reader.num_rows() as u32));
+        num_pages_written += lookup_reader.num_rows() as u32;
+    }
+
+    // Mark as range-partitioned so the load path constructs `ranges_to_files`
+    // and uses `LazyRangedIndexReader` to dispatch page reads to partition files.
+    metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
+    metadata.insert(
+        PAGE_NUM_PER_RANGE_PARTITION_META_KEY.to_string(),
+        serde_json::to_string(&pages_per_file)?,
+    );
+
     lookup_file.finish_with_metadata(metadata).await?;
 
-    // After successfully writing the merged files, delete all partition files
-    // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
-    cleanup_partition_files(store, part_lookup_files, part_page_files).await;
+    // Only clean up lookup files; page_data files are kept for the load path.
+    cleanup_partition_files(store, part_lookup_files, &[]).await;
 
     Ok(())
 }
@@ -2232,104 +2222,6 @@ fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatc
     new_columns[page_idx_pos] = new_page_idx_array_ref;
     let new_batch = RecordBatch::try_new(batch.schema(), new_columns)?;
     Ok(new_batch)
-}
-
-/// Merge pages using Datafusion's SortPreservingMergeExec
-/// which implements a K-way merge algorithm with fixed-size output batches
-async fn merge_pages(
-    part_lookup_files: &[String],
-    page_files_map: &HashMap<u64, &String>,
-    store: &dyn IndexStore,
-    batch_size: u64,
-    page_file: &mut Box<dyn IndexWriter>,
-    arrow_schema: Arc<Schema>,
-    batch_readhead: Option<usize>,
-) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
-    let mut lookup_entries = Vec::new();
-    let mut page_idx = 0u32;
-
-    debug!(
-        "Starting SortPreservingMerge with {} partitions",
-        part_lookup_files.len()
-    );
-
-    let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
-    let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
-
-    // Create execution plans for each stream
-    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    for lookup_file in part_lookup_files {
-        let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
-            Error::internal(format!(
-                "Page file not found for partition ID: {}",
-                partition_id
-            ))
-        })?)
-        .clone();
-
-        let reader = store.open_index_file(&page_file_name).await?;
-
-        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
-
-        let stream = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(batch_readhead.unwrap_or(1))
-            .boxed();
-
-        let sendable_stream =
-            Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
-        inputs.push(Arc::new(OneShotExec::new(sendable_stream)));
-    }
-
-    // Create Union execution plan to combine all partitions
-    let union_inputs = UnionExec::try_new(inputs)?;
-
-    // Create SortPreservingMerge execution plan
-    let value_column_index = stream_schema.index_of(VALUE_COLUMN_NAME)?;
-    let sort_expr = PhysicalSortExpr {
-        expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
-        options: SortOptions {
-            descending: false,
-            nulls_first: true,
-        },
-    };
-
-    let merge_exec = Arc::new(SortPreservingMergeExec::new(
-        [sort_expr].into(),
-        union_inputs,
-    ));
-
-    let unchunked = execute_plan(
-        merge_exec,
-        LanceExecutionOptions {
-            use_spilling: false,
-            ..Default::default()
-        },
-    )?;
-
-    // Use chunk_concat_stream to ensure fixed batch sizes
-    let mut chunked_stream = chunk_concat_stream(unchunked, batch_size as usize);
-
-    // Process chunked stream
-    while let Some(batch) = chunked_stream.try_next().await? {
-        let writer_batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![batch.column(0).clone(), batch.column(1).clone()],
-        )?;
-
-        page_file.write_record_batch(writer_batch).await?;
-
-        let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
-        let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
-        let null_count = batch.column(0).null_count() as u32;
-
-        lookup_entries.push((min_val, max_val, null_count, page_idx));
-        page_idx += 1;
-    }
-
-    Ok(lookup_entries)
 }
 
 // Sorts file paths by the partition ID extracted from file name.
