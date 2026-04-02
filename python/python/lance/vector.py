@@ -211,7 +211,6 @@ def train_ivf_centroids_on_accelerator(
 ) -> Tuple[np.ndarray, Any]:
     """Use accelerator (GPU or MPS) to train kmeans."""
 
-    from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
 
     metric_type = _normalize_metric_type(metric_type)
@@ -234,27 +233,34 @@ def train_ivf_centroids_on_accelerator(
     else:
         filt = None
 
-    LOGGER.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
-
-    ds = TorchDataset(
+    # Sample once into memory (mirrors the Rust CPU path), then reuse for
+    # both initial centroid selection and KMeans training.
+    LOGGER.info(
+        "Sampling %d vectors for IVF training from %s (filt=%s)",
+        sample_size,
         dataset,
-        batch_size=k,
-        columns=[column],
-        samples=sample_size,
-        filter=filt,
+        filt,
     )
 
-    init_centroids = next(iter(ds))
-    LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
+    from .sampler import maybe_sample
 
-    ds = TorchDataset(
-        dataset,
-        batch_size=20480,
-        columns=[column],
-        samples=sample_size,
-        filter=filt,
-        cache=True,
+    batches = list(maybe_sample(dataset, sample_size, [column], filt=filt))
+    tbl = pa.concat_tables(
+        [pa.Table.from_batches([b]) for b in batches]
+    ).combine_chunks()
+    training_data = tbl.column(column).to_numpy(zero_copy_only=False)
+    training_data = np.stack(training_data).astype(np.float32)
+    del tbl, batches
+
+    LOGGER.info(
+        "Sampled %d vectors into memory (%.1f MB)",
+        training_data.shape[0],
+        training_data.nbytes / 1024 / 1024,
     )
+
+    # Pick k random rows as initial centroids.
+    init_indices = np.random.choice(training_data.shape[0], k, replace=False)
+    init_centroids = torch.from_numpy(training_data[init_indices])
 
     LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
     kmeans = KMeans(
@@ -264,7 +270,10 @@ def train_ivf_centroids_on_accelerator(
         device=accelerator,
         centroids=init_centroids,
     )
-    kmeans.fit(ds)
+    # Pass the full training data as a Tensor so KMeans iterates in memory
+    # (no disk cache, no re-sampling).
+    kmeans.fit(torch.from_numpy(training_data))
+    del training_data
 
     centroids = (
         kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
