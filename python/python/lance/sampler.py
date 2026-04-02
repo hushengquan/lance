@@ -48,9 +48,14 @@ def _efficient_sample(
     n: int,
     columns: Optional[Union[List[str], Dict[str, str]]],
     batch_size: int,
-    max_takes: int,
 ) -> Generator[pa.RecordBatch, None, None]:
     """Sample n records from the dataset.
+
+    Mirrors the Rust ``sample_fsl_uniform`` strategy: generate n uniformly
+    random indices, sort them, and take in large contiguous chunks (default
+    8192 rows per take).  Sorting allows the underlying object store to merge
+    adjacent row reads into fewer, larger range requests, which drastically
+    reduces I/O latency on remote storage (e.g. S3).
 
     Parameters
     ----------
@@ -61,55 +66,47 @@ def _efficient_sample(
     columns : list[str]
         The columns to load.
     batch_size : int
-        The batch size to use when loading the data.
-    max_takes : int
-        The maximum number of takes to perform. This is used to limit the number of
-        random reads. Large enough value can give a good random sample without
-        having to issue too many random reads.
+        The batch size to use when yielding output RecordBatches.
 
     Returns
     -------
     Generator of a RecordBatch.
     """
-    buf: list[pa.RecordBatch] = []
     total_records = len(dataset)
     assert total_records > n
-    chunk_size = total_records // max_takes
-    chunk_sample_size = n // max_takes
 
-    num_sampled = 0
+    indices = np.random.choice(total_records, n, replace=False)
+    indices.sort()
 
-    for idx, i in enumerate(range(0, total_records, chunk_size)):
-        # If we have already sampled enough, break. This can happen if there
-        # is a remainder in the division.
-        if num_sampled >= n:
-            break
-        num_sampled += chunk_sample_size
+    LOGGER.info(
+        "Sampling %d rows from %d total (sorted random indices, chunk take)",
+        n,
+        total_records,
+    )
 
-        # If we are at the last chunk, we may not have enough records to sample.
-        local_size = min(chunk_size, total_records - i)
-        local_sample_size = min(chunk_sample_size, local_size)
+    take_chunk_size = 8192
+    buf: list[pa.RecordBatch] = []
 
-        if local_sample_size < local_size:
-            # Add more randomness within each chunk, if there is room.
-            offset = i + np.random.randint(0, local_size - local_sample_size)
-        else:
-            offset = i
-
-        buf.extend(
-            dataset.take(
-                list(range(offset, offset + local_sample_size)),
-                columns=columns,
-            ).to_batches()
+    for start in range(0, len(indices), take_chunk_size):
+        chunk = indices[start : start + take_chunk_size].tolist()
+        buf.extend(dataset.take(chunk, columns=columns).to_batches())
+        LOGGER.info(
+            "Sampled chunk %d/%d, rows %d-%d",
+            start // take_chunk_size + 1,
+            math.ceil(len(indices) / take_chunk_size),
+            chunk[0],
+            chunk[-1],
         )
-        if idx % 50 == 0:
-            LOGGER.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
-        if sum(len(b) for b in buf) >= batch_size:
+        while sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
-            tbl = tbl.combine_chunks()
-            yield tbl.to_batches()[0]
-            del tbl
+            batch_tbl = tbl.slice(0, batch_size).combine_chunks()
+            rest_tbl = tbl.slice(batch_size)
+            yield batch_tbl.to_batches()[0]
+            del batch_tbl
+            if rest_tbl.num_rows > 0:
+                buf.extend(rest_tbl.to_batches())
+            del rest_tbl, tbl
     if buf:
         tbl = pa.Table.from_batches(buf).combine_chunks()
         yield tbl.to_batches()[0]
@@ -121,10 +118,10 @@ def _filtered_efficient_sample(
     n: int,
     columns: List[str],
     batch_size: int,
-    target_takes: int,
     filter: str,
 ) -> Generator[pa.RecordBatch, None, None]:
     total_records = len(dataset)
+    target_takes = max(1, n // 32)
     shard_size = math.ceil(n / target_takes)
     num_shards = math.ceil(total_records / shard_size)
 
@@ -189,10 +186,7 @@ def maybe_sample(
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
     max_takes : int, optional
-        The maximum number of takes to perform, by default 2048.
-        This is employed to minimize the number of random reads necessary for sampling.
-        A sufficiently large value can provide an effective random sample without
-        the need for excessive random reads.
+        Deprecated and ignored. Kept for API compatibility only.
     filter : str, optional
         The filter to apply to the dataset, by default None.  If a filter is provided,
         then we will first load all row ids in memory and then batch through the ids
@@ -215,19 +209,9 @@ def maybe_sample(
             columns=columns, batch_size=batch_size, filter=filt
         )
     elif filt is not None:
-        yield from _filtered_efficient_sample(
-            dataset, n, columns, batch_size, max_takes, filt
-        )
-    elif n > max_takes:
-        yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
+        yield from _filtered_efficient_sample(dataset, n, columns, batch_size, filt)
     else:
-        choices = np.random.choice(len(dataset), n, replace=False)
-        idx = 0
-        while idx < len(choices):
-            end = min(idx + batch_size, len(choices))
-            tbl = dataset.take(choices[idx:end], columns=columns).combine_chunks()
-            yield tbl.to_batches()[0]
-            idx += batch_size
+        yield from _efficient_sample(dataset, n, columns, batch_size)
 
 
 T = TypeVar("T")

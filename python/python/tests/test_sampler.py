@@ -18,7 +18,6 @@ TEST_CONFIG = {
     "master_addr": "127.0.0.1",
     "seed": 42,
     "test_shard_ratio": 0.5,
-    "max_takes_factor": 0.1,
 }
 
 
@@ -270,8 +269,8 @@ def test_sample_dataset(tmp_path: Path, nrows: int):
     assert simple_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])
     assert simple_scan[0].num_rows == min(nrows, 128)
 
-    # Random path.
-    large_scan = list(maybe_sample(ds, 128, ["vec"], max_takes=32))
+    # Sorted-index take path (n < len(dataset)).
+    large_scan = list(maybe_sample(ds, 128, ["vec"]))
     assert len(large_scan) == 1
     assert isinstance(large_scan[0], pa.RecordBatch)
     assert large_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])

@@ -62,7 +62,7 @@ def iter_over_dataset(tmp_path):
         assert batch["vec"].shape[1] == 32
     assert total_rows == 1024
 
-    # test when sample size is greater than max_takes
+    # test larger sample size
     torch_ds = LanceDataset(
         ds,
         batch_size=256,
