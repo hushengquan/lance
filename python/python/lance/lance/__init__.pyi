@@ -316,6 +316,12 @@ class _Dataset:
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> _Dataset: ...
+    def deep_clone(
+        self,
+        target_path: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> _Dataset: ...
     def restore(self): ...
     def cleanup_old_versions(
         self,

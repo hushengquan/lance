@@ -5294,6 +5294,46 @@ def test_branches(tmp_path: Path):
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
 
 
+def test_deep_clone(tmp_path: Path):
+    """Deep clone copies all data files into a fully independent dataset."""
+    # Prepare source dataset with two versions
+    src_dir = tmp_path / "deep_src"
+    table_v1 = pa.table({"a": [1, 2, 3], "b": [10, 20, 30]})
+    lance.write_dataset(table_v1, src_dir, mode="create")
+
+    table_v2 = pa.table({"a": [4, 5, 6], "b": [40, 50, 60]})
+    ds = lance.write_dataset(table_v2, src_dir, mode="overwrite")
+
+    # Tag version 1 for reference
+    ds.tags.create("v1", 1)
+
+    # Deep clone by numeric version (v2)
+    clone_v2_dir = tmp_path / "deep_clone_v2"
+    ds_clone_v2 = ds.deep_clone(clone_v2_dir, 2)
+    assert ds_clone_v2.to_table() == table_v2
+    # Re-open independently to verify files were actually copied
+    assert lance.dataset(clone_v2_dir).to_table() == table_v2
+
+    # Deep clone by tag (v1)
+    clone_v1_dir = tmp_path / "deep_clone_v1"
+    ds_clone_v1 = ds.deep_clone(clone_v1_dir, "v1")
+    assert ds_clone_v1.to_table() == table_v1
+    assert lance.dataset(clone_v1_dir).to_table() == table_v1
+
+    # Deep clone from a branch
+    table_v3 = pa.table({"a": [7, 8, 9], "b": [70, 80, 90]})
+    branch = ds.create_branch("branch", 2)
+    lance.write_dataset(table_v3, branch.uri, mode="overwrite")
+    clone_branch_dir = tmp_path / "deep_clone_branch"
+    cloned_branch = branch.deep_clone(clone_branch_dir, 3)
+    assert cloned_branch.to_table() == table_v3
+    assert lance.dataset(clone_branch_dir).to_table() == table_v3
+
+    # Cloning to an existing target should error
+    with pytest.raises(OSError):
+        ds.deep_clone(clone_v2_dir, 2)
+
+
 def test_default_scan_options_nearest(tmp_path: Path) -> None:
     dim = 4
     num_rows = 10
